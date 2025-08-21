@@ -1,0 +1,497 @@
+// ===== package.json =====
+/*
+{
+  "name": "minecraft-ai-agent",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "mineflayer": "^4.14.0",
+    "mineflayer-pathfinder": "^2.4.5",
+    "mineflayer-collectblock": "^1.4.1",
+    "vec3": "^0.1.8",
+    "@anthropic-ai/sdk": "^0.20.0",
+    "dotenv": "^16.3.1"
+  }
+}
+*/
+
+// ===== .env =====
+/*
+ANTHROPIC_API_KEY=your_api_key_here
+MINECRAFT_HOST=localhost
+MINECRAFT_PORT=25565  # LANに公開した際のポート番号を入力
+MINECRAFT_USERNAME=AIBot
+MINECRAFT_VERSION=1.20.1
+MINECRAFT_AUTH=offline  # ローカルプレイ用
+*/
+
+// ===== src/config.js =====
+import dotenv from 'dotenv';
+dotenv.config();
+
+export const config = {
+  minecraft: {
+    host: process.env.MINECRAFT_HOST || 'localhost',
+    port: parseInt(process.env.MINECRAFT_PORT) || 25565,
+    username: process.env.MINECRAFT_USERNAME || 'AIBot',
+    version: process.env.MINECRAFT_VERSION || '1.20.1'
+  },
+  ai: {
+    apiKey: process.env.ANTHROPIC_API_KEY,
+    model: 'claude-3-sonnet-20240229'
+  }
+};
+
+// ===== src/ai/llmInterface.js =====
+import Anthropic from '@anthropic-ai/sdk';
+
+class LLMInterface {
+  constructor(apiKey) {
+    this.anthropic = new Anthropic({ apiKey });
+  }
+
+  async parseCommand(userInput, gameState) {
+    const prompt = `
+あなたはMinecraftのAIエージェントです。
+ユーザーの指示を解析し、実行可能なタスクリストに変換してください。
+
+現在の状態:
+- 位置: ${JSON.stringify(gameState.position)}
+- 体力: ${gameState.health}
+- 空腹度: ${gameState.food}
+- インベントリ: ${JSON.stringify(gameState.inventory)}
+
+ユーザーの指示: "${userInput}"
+
+以下の形式でJSONを返してください:
+{
+  "tasks": [
+    {
+      "action": "動作タイプ",
+      "parameters": {},
+      "description": "説明"
+    }
+  ],
+  "summary": "実行計画の要約"
+}
+
+利用可能なアクション:
+- move: 指定座標への移動 (parameters: {x, y, z})
+- mine: ブロックの破壊 (parameters: {blockType})
+- place: ブロックの設置 (parameters: {blockType, position})
+- collect: アイテム収集 (parameters: {itemType, amount})
+- craft: アイテムクラフト (parameters: {item, amount})
+- chat: チャットメッセージ送信 (parameters: {message})
+`;
+
+    try {
+      const response = await this.anthropic.messages.create({
+        model: 'claude-3-sonnet-20240229',
+        max_tokens: 1000,
+        messages: [{
+          role: 'user',
+          content: prompt
+        }]
+      });
+
+      const content = response.content[0].text;
+      // JSONを抽出
+      const jsonMatch = content.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        return JSON.parse(jsonMatch[0]);
+      }
+      throw new Error('JSONの解析に失敗しました');
+    } catch (error) {
+      console.error('LLM解析エラー:', error);
+      return null;
+    }
+  }
+
+  async getNextAction(currentSituation, goal) {
+    const prompt = `
+現在の状況: ${currentSituation}
+目標: ${goal}
+
+次に実行すべき具体的なアクションを1つ提案してください。
+`;
+
+    try {
+      const response = await this.anthropic.messages.create({
+        model: 'claude-3-sonnet-20240229',
+        max_tokens: 500,
+        messages: [{
+          role: 'user',
+          content: prompt
+        }]
+      });
+
+      return response.content[0].text;
+    } catch (error) {
+      console.error('LLMエラー:', error);
+      return null;
+    }
+  }
+}
+
+export default LLMInterface;
+
+// ===== src/bot/minecraftBot.js =====
+import mineflayer from 'mineflayer';
+import { pathfinder, Movements, goals } from 'mineflayer-pathfinder';
+import vec3 from 'vec3';
+
+class MinecraftBot {
+  constructor(config) {
+    this.config = config;
+    this.bot = null;
+    this.isConnected = false;
+    this.currentTask = null;
+  }
+
+  async connect() {
+    return new Promise((resolve, reject) => {
+      // ローカルゲーム用の設定
+      const botOptions = {
+        host: this.config.host,
+        port: this.config.port,
+        username: this.config.username,
+        version: this.config.version,
+        auth: 'offline'  // ローカルプレイ用（認証をスキップ）
+      };
+
+      // LANゲームの場合の追加設定
+      if (this.config.host === 'localhost' || this.config.host === '127.0.0.1') {
+        botOptions.skipValidation = true;  // ローカル接続の検証をスキップ
+      }
+
+      this.bot = mineflayer.createBot(botOptions);
+
+      // Pathfinderプラグインを読み込み
+      this.bot.loadPlugin(pathfinder);
+
+      this.bot.once('spawn', () => {
+        console.log('ボットがスポーンしました');
+        this.isConnected = true;
+        
+        // Pathfinderの初期設定
+        const mcData = require('minecraft-data')(this.bot.version);
+        const defaultMove = new Movements(this.bot, mcData);
+        this.bot.pathfinder.setMovements(defaultMove);
+        
+        resolve();
+      });
+
+      this.bot.on('error', (err) => {
+        console.error('ボットエラー:', err);
+        reject(err);
+      });
+
+      this.bot.on('kicked', (reason) => {
+        console.log('サーバーからキックされました:', reason);
+        this.isConnected = false;
+      });
+
+      this.bot.on('end', () => {
+        console.log('接続が終了しました');
+        this.isConnected = false;
+      });
+
+      // チャットメッセージを監視
+      this.bot.on('chat', (username, message) => {
+        if (username === this.bot.username) return;
+        console.log(`${username}: ${message}`);
+      });
+    });
+  }
+
+  getGameState() {
+    if (!this.bot) return null;
+
+    return {
+      position: this.bot.entity.position,
+      health: this.bot.health,
+      food: this.bot.food,
+      inventory: this.getInventoryItems(),
+      nearbyBlocks: this.getNearbyBlocks(),
+      nearbyEntities: this.getNearbyEntities()
+    };
+  }
+
+  getInventoryItems() {
+    if (!this.bot) return [];
+    
+    return this.bot.inventory.items().map(item => ({
+      name: item.name,
+      count: item.count,
+      slot: item.slot
+    }));
+  }
+
+  getNearbyBlocks(radius = 5) {
+    if (!this.bot) return [];
+    
+    const blocks = [];
+    const pos = this.bot.entity.position;
+    
+    for (let x = -radius; x <= radius; x++) {
+      for (let y = -radius; y <= radius; y++) {
+        for (let z = -radius; z <= radius; z++) {
+          const block = this.bot.blockAt(pos.offset(x, y, z));
+          if (block && block.name !== 'air') {
+            blocks.push({
+              name: block.name,
+              position: block.position
+            });
+          }
+        }
+      }
+    }
+    
+    return blocks;
+  }
+
+  getNearbyEntities(radius = 10) {
+    if (!this.bot) return [];
+    
+    const entities = [];
+    for (const entity of Object.values(this.bot.entities)) {
+      if (entity === this.bot.entity) continue;
+      
+      const distance = this.bot.entity.position.distanceTo(entity.position);
+      if (distance <= radius) {
+        entities.push({
+          type: entity.type,
+          name: entity.username || entity.name,
+          position: entity.position,
+          distance: distance
+        });
+      }
+    }
+    
+    return entities;
+  }
+
+  // 基本アクション
+  async moveToPosition(x, y, z) {
+    const goal = new goals.GoalBlock(x, y, z);
+    this.bot.pathfinder.setGoal(goal);
+    
+    return new Promise((resolve) => {
+      this.bot.once('goal_reached', () => {
+        console.log(`位置 (${x}, ${y}, ${z}) に到達しました`);
+        resolve(true);
+      });
+      
+      setTimeout(() => {
+        this.bot.pathfinder.setGoal(null);
+        resolve(false);
+      }, 30000); // 30秒でタイムアウト
+    });
+  }
+
+  async mineBlock(blockType) {
+    const blocks = this.bot.findBlocks({
+      matching: (block) => block.name === blockType,
+      maxDistance: 32,
+      count: 1
+    });
+
+    if (blocks.length === 0) {
+      console.log(`${blockType} が見つかりません`);
+      return false;
+    }
+
+    const targetBlock = this.bot.blockAt(blocks[0]);
+    
+    try {
+      await this.bot.pathfinder.goto(new goals.GoalLookAtBlock(blocks[0], this.bot.world));
+      await this.bot.dig(targetBlock);
+      console.log(`${blockType} を破壊しました`);
+      return true;
+    } catch (error) {
+      console.error(`ブロック破壊エラー:`, error);
+      return false;
+    }
+  }
+
+  async collectItems(itemType = null, amount = 1) {
+    let collected = 0;
+    
+    for (const entity of Object.values(this.bot.entities)) {
+      if (entity.name === 'item') {
+        if (itemType && entity.metadata[7]?.name !== itemType) continue;
+        
+        try {
+          await this.bot.pathfinder.goto(new goals.GoalBlock(entity.position.x, entity.position.y, entity.position.z));
+          collected++;
+          
+          if (collected >= amount) break;
+        } catch (error) {
+          console.error('アイテム収集エラー:', error);
+        }
+      }
+    }
+    
+    console.log(`${collected}個のアイテムを収集しました`);
+    return collected;
+  }
+
+  sendChat(message) {
+    this.bot.chat(message);
+  }
+
+  async disconnect() {
+    if (this.bot) {
+      this.bot.quit();
+      this.isConnected = false;
+    }
+  }
+}
+
+export default MinecraftBot;
+
+// ===== src/taskExecutor.js =====
+class TaskExecutor {
+  constructor(bot, llm) {
+    this.bot = bot;
+    this.llm = llm;
+    this.taskQueue = [];
+    this.isExecuting = false;
+  }
+
+  async executeCommand(userInput) {
+    const gameState = this.bot.getGameState();
+    const parsedCommand = await this.llm.parseCommand(userInput, gameState);
+    
+    if (!parsedCommand || !parsedCommand.tasks) {
+      console.log('コマンドの解析に失敗しました');
+      return false;
+    }
+
+    console.log('実行計画:', parsedCommand.summary);
+    
+    for (const task of parsedCommand.tasks) {
+      await this.executeTask(task);
+    }
+    
+    return true;
+  }
+
+  async executeTask(task) {
+    console.log(`実行中: ${task.description}`);
+    
+    try {
+      switch (task.action) {
+        case 'move':
+          await this.bot.moveToPosition(
+            task.parameters.x,
+            task.parameters.y,
+            task.parameters.z
+          );
+          break;
+          
+        case 'mine':
+          await this.bot.mineBlock(task.parameters.blockType);
+          break;
+          
+        case 'collect':
+          await this.bot.collectItems(
+            task.parameters.itemType,
+            task.parameters.amount
+          );
+          break;
+          
+        case 'chat':
+          this.bot.sendChat(task.parameters.message);
+          break;
+          
+        default:
+          console.log(`未実装のアクション: ${task.action}`);
+      }
+    } catch (error) {
+      console.error(`タスク実行エラー:`, error);
+    }
+  }
+}
+
+export default TaskExecutor;
+
+// ===== src/index.js =====
+import readline from 'readline';
+import { config } from './config.js';
+import MinecraftBot from './bot/minecraftBot.js';
+import LLMInterface from './ai/llmInterface.js';
+import TaskExecutor from './taskExecutor.js';
+
+async function main() {
+  console.log('Minecraft AI エージェントを起動しています...');
+  
+  // ローカルゲーム接続の説明
+  console.log('\n=== ローカルゲームへの接続方法 ===');
+  console.log('1. Minecraftでワールドを開く');
+  console.log('2. ESC → "LANに公開"');
+  console.log('3. 表示されたポート番号を.envファイルに設定');
+  console.log('4. このプログラムを再起動\n');
+  
+  // コンポーネントの初期化
+  const bot = new MinecraftBot(config.minecraft);
+  const llm = new LLMInterface(config.ai.apiKey);
+  const executor = new TaskExecutor(bot, llm);
+  
+  try {
+    // Minecraftサーバーに接続
+    console.log(`${config.minecraft.host}:${config.minecraft.port} に接続中...`);
+    await bot.connect();
+    console.log('ゲームに接続しました！');
+    
+    // 初期位置の表示
+    setTimeout(() => {
+      const state = bot.getGameState();
+      console.log(`ボットの位置: X:${Math.floor(state.position.x)}, Y:${Math.floor(state.position.y)}, Z:${Math.floor(state.position.z)}`);
+    }, 2000);
+    
+    // コマンドラインインターフェースの設定
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout
+    });
+    
+    console.log('\n指示を入力してください (終了: exit)');
+    console.log('例: "木を5本集めて", "前に10ブロック進んで", "家を建てて"');
+    
+    rl.on('line', async (input) => {
+      if (input.toLowerCase() === 'exit') {
+        await bot.disconnect();
+        process.exit(0);
+      }
+      
+      if (input.toLowerCase() === 'status') {
+        console.log('現在の状態:', bot.getGameState());
+        return;
+      }
+      
+      // LLMを使用してコマンドを実行
+      await executor.executeCommand(input);
+    });
+    
+  } catch (error) {
+    console.error('起動エラー:', error);
+    process.exit(1);
+  }
+}
+
+// エラーハンドリング
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('未処理のPromise拒否:', reason);
+});
+
+process.on('SIGINT', async () => {
+  console.log('\n終了処理中...');
+  process.exit(0);
+});
+
+// アプリケーションの起動
+main();
