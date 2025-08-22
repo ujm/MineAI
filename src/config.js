@@ -19,7 +19,7 @@ export const config = {
   // AI (Claude) 設定
   ai: {
     apiKey: process.env.ANTHROPIC_API_KEY,
-    model: 'claude-3-sonnet-20240229',
+    model: 'claude-sonnet-4-20250514',
     maxTokens: 1000,
     timeout: 30000 // 30秒
   },

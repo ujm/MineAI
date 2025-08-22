@@ -4,7 +4,7 @@ import Anthropic from '@anthropic-ai/sdk';
  * Claude API インターフェース
  */
 class LLMInterface {
-  constructor(apiKey, model = 'claude-3-sonnet-20240229') {
+  constructor(apiKey, model = 'claude-sonnet-4-20250514') {
     if (!apiKey) {
       throw new Error('Anthropic API キーが必要です');
     }
