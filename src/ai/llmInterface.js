@@ -24,9 +24,11 @@ export class LLMInterface {
       
       // analyzeTaskメソッドを使用してタスクを解析
       const analysisResult = await this.analyzeTask(instruction, context);
+      console.log(`📋 解析結果:`, JSON.stringify(analysisResult, null, 2));
       
       // TaskExecutorが期待する形式に変換
       const actions = this.convertTasksToActions(analysisResult.tasks || []);
+      console.log(`🎯 変換された最終アクション:`, JSON.stringify(actions, null, 2));
       
       return {
         success: true,
@@ -46,34 +48,48 @@ export class LLMInterface {
    * analyzeTaskの結果をActionの形式に変換
    */
   convertTasksToActions(tasks) {
+    console.log(`🔄 タスク変換開始 - 入力タスク数: ${tasks.length}`);
     const actions = [];
     
-    for (const task of tasks) {
+    for (let i = 0; i < tasks.length; i++) {
+      const task = tasks[i];
+      console.log(`📝 タスク ${i + 1}を処理中:`, JSON.stringify(task, null, 2));
+      
       switch (task.type) {
         case 'move':
+          console.log(`🚶 移動タスクを処理中 - target: ${JSON.stringify(task.target)}, details: ${JSON.stringify(task.details)}`);
+          
           if (typeof task.target === 'object' && task.target.x !== undefined) {
             // 絶対座標移動
-            actions.push({
+            const action = {
               action: 'move',
               params: {
                 x: task.target.x,
                 y: task.target.y || 64,
                 z: task.target.z
               }
-            });
-          } else if (task.details && task.details.direction) {
+            };
+            console.log(`🎯 絶対移動アクション作成: ${JSON.stringify(action)}`);
+            actions.push(action);
+          } else if (task.target === 'relative' && task.details && task.details.direction) {
             // 相対移動
+            console.log(`➡️ 相対移動アクション作成 - 方向: ${task.details.direction}, 距離: ${task.details.distance || 1}`);
             const direction = this.parseDirection(task.details.direction, task.details.distance || 1);
-            actions.push({
+            const action = {
               action: 'moveRelative',
               params: direction
-            });
+            };
+            console.log(`✅ アクション ${actions.length + 1} 追加完了: ${JSON.stringify(action)}`);
+            actions.push(action);
           } else {
             // デフォルトの前進
-            actions.push({
+            console.log(`⚠️  不明な移動タスク - デフォルト前進を使用`);
+            const action = {
               action: 'moveRelative',
               params: { x: 1, y: 0, z: 0 }
-            });
+            };
+            console.log(`🚶 デフォルト前進アクション: ${JSON.stringify(action)}`);
+            actions.push(action);
           }
           break;
           
@@ -128,11 +144,12 @@ export class LLMInterface {
           break;
           
         default:
-          console.warn(`Unknown task type: ${task.type}`);
+          console.warn(`❌ Unknown task type: ${task.type}`);
           break;
       }
     }
     
+    console.log(`🏁 タスク変換完了 - 出力アクション数: ${actions.length}`);
     return actions;
   }
 
